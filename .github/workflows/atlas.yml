@@ -48,7 +48,7 @@ jobs:
 
   build:
     needs: select
-    if: always() && (github.event_name == 'workflow_dispatch' && inputs.mode != 'sync-preview' || needs.select.result == 'success' && needs.select.outputs.needs_update == 'true')
+    if: always() && !cancelled() && (github.event_name == 'workflow_dispatch' && inputs.mode != 'sync-preview' || needs.select.result == 'success' && needs.select.outputs.needs_update == 'true')
     runs-on: ubuntu-24.04
     outputs:
       source_sha: ${{ steps.pin.outputs.sha }}
@@ -238,7 +238,7 @@ jobs:
           echo '- Build or verification failed; see failed step. Existing publication remains unchanged.' >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
-    if: needs.build.result == 'success' && needs.build.outputs.mode == 'release'
+    if: always() && !cancelled() && needs.build.result == 'success' && needs.build.outputs.mode == 'release'
     needs: build
     runs-on: ubuntu-latest
     permissions: { contents: read, actions: read, pages: write, id-token: write }
