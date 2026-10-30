@@ -61,9 +61,9 @@ class WorkflowConditions(unittest.TestCase):
                 self.assertFalse(self.scenario('schedule', '', result, update, 'skipped', '')[2])
         self.assertFalse(self.scenario('schedule', '', 'success', 'true', 'success', 'release', cancelled=True)[2])
 
-    def test_schedule_remains_disabled(self):
+    def test_schedule_runs_every_thirty_minutes(self):
         text = WORKFLOW.read_text()
-        self.assertNotRegex(text, r'(?m)^  schedule:')
+        self.assertRegex(text, r"(?m)^  schedule:\n    - cron: '\*/30 \* \* \* \*'$")
 
 
 if __name__ == '__main__':

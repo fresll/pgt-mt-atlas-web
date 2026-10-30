@@ -1,9 +1,8 @@
 name: Atlas — verified build and publication
 
 on:
-  # After approval enable polling by uncommenting the following two lines:
-  # schedule:
-  #   - cron: '*/30 * * * *'
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:
