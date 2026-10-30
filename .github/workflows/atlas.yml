@@ -1,0 +1,212 @@
+name: Atlas — verified manual build and publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview: noindex artifact only; release: publish to configured custom domain'
+        required: true
+        type: choice
+        default: preview
+        options: [preview, release]
+      release_confirmation:
+        description: 'Only for release: type PUBLISH atlas.mazunin.science'
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: atlas-web
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.pin.outputs.sha }}
+      manifest_sha: ${{ steps.provenance.outputs.sha }}
+    steps:
+      - name: Check out publication configuration
+        uses: actions/checkout@v4
+        with: { path: config, persist-credentials: false }
+      - name: Read and validate the immutable source pin
+        id: pin
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRMATION: ${{ inputs.release_confirmation }}
+          CONFIG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == release ]]; then
+            [[ "$CONFIG_REF" == refs/heads/main && "$CONFIRMATION" == 'PUBLISH atlas.mazunin.science' ]] || { echo 'Release requires main and explicit confirmation'; exit 1; }
+          fi
+          [[ $(wc -l < config/source.env) -eq 2 ]]
+          SHA=$(sed -n 's/^ATLAS_SOURCE_SHA=//p' config/source.env)
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out pinned scientific source
+        uses: actions/checkout@v4
+        with:
+          repository: fresll/pgt-mt-atlas
+          ref: ${{ steps.pin.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify source identity
+        working-directory: source
+        env: { EXPECTED_SHA: '${{ steps.pin.outputs.sha }}' }
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12.11' }
+      - name: Install Python check dependencies
+        run: python -m pip install -r config/requirements-checks.txt
+      - name: Scientific ETL and golden tests
+        working-directory: source/etl
+        run: |
+          python -m atlas_etl.build --check
+          python -m pytest -q
+          python -m atlas_etl.build
+          git diff --quiet -I '"dataset_version"' -- ../site/public/data ../site/src/data
+          git restore -- ../site/public/data ../site/src/data
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.21.1', cache: npm, cache-dependency-path: source/site/package-lock.json }
+      - name: Install locked site dependencies and check source
+        working-directory: source/site
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+      - name: Build for existing scientific and technical browser tests
+        working-directory: source/site
+        env: { ATLAS_BASE: /pgt-mt-atlas/ }
+        run: npm run build
+      - run: npx playwright install --with-deps chromium
+        working-directory: source/site
+      - name: Existing browser tests
+        working-directory: source/site
+        env: { ATLAS_BASE: /pgt-mt-atlas/ }
+        run: npm run e2e
+      - name: Build public test candidate for the original suite
+        working-directory: source/site
+        env:
+          ATLAS_BASE: /pgt-mt-atlas/
+          ATLAS_SOFT_LAUNCH: '0'
+          ATLAS_PUBLIC_LAUNCH: '1'
+          ATLAS_CANONICAL_BASE: https://atlas.mazunin.science/
+          VITE_ATLAS_PRIVATE_PREVIEW: '0'
+          VITE_ATLAS_ENGLISH_PUBLIC: '1'
+          VITE_ATLAS_CHINESE_PUBLIC: '1'
+          VITE_ATLAS_ARABIC_PUBLIC: '1'
+        run: npm run build
+      - name: Public and Chinese browser suites
+        working-directory: source/site
+        env: { ATLAS_BASE: /pgt-mt-atlas/ }
+        run: |
+          npm run e2e:public
+          npx playwright test --config playwright.chinese.config.ts
+      - name: Build and validate root release candidate
+        working-directory: source/site
+        env:
+          ATLAS_BASE: /
+          ATLAS_SOFT_LAUNCH: '0'
+          ATLAS_PUBLIC_LAUNCH: '1'
+          ATLAS_CANONICAL_BASE: https://atlas.mazunin.science/
+          VITE_ATLAS_PRIVATE_PREVIEW: '0'
+          VITE_ATLAS_ENGLISH_PUBLIC: '1'
+          VITE_ATLAS_CHINESE_PUBLIC: '1'
+          VITE_ATLAS_ARABIC_PUBLIC: '1'
+        run: |
+          npm run build
+          python scripts/audit-indexing.py
+          npx playwright test --config playwright.domain.config.ts
+      - name: Rebuild safe noindex preview
+        if: inputs.mode == 'preview'
+        working-directory: source/site
+        env:
+          ATLAS_BASE: /
+          ATLAS_SOFT_LAUNCH: '1'
+          ATLAS_PUBLIC_LAUNCH: '0'
+          ATLAS_CANONICAL_BASE: https://atlas.mazunin.science/
+          VITE_ATLAS_PRIVATE_PREVIEW: '0'
+          VITE_ATLAS_ENGLISH_PUBLIC: '1'
+          VITE_ATLAS_CHINESE_PUBLIC: '1'
+          VITE_ATLAS_ARABIC_PUBLIC: '1'
+        run: |
+          npm run build
+          python ../../config/scripts/verify-preview.py dist
+          node e2e/static-server.mjs 4175 '' > "$RUNNER_TEMP/atlas-preview.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for i in {1..30}; do curl --silent --fail http://127.0.0.1:4175/ >/dev/null && break; sleep 1; done
+          node ../../config/scripts/preview-smoke.cjs .
+      - name: Verify unmodified pinned source and record artifact hashes
+        id: provenance
+        env:
+          EXPECTED_SHA: ${{ steps.pin.outputs.sha }}
+          CONFIG_SHA: ${{ github.sha }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git -C source status --porcelain --untracked-files=no)"
+          python config/scripts/provenance.py write source/site/dist --source "$EXPECTED_SHA" --config-sha "$CONFIG_SHA" --mode "$MODE"
+          python config/scripts/provenance.py verify source/site/dist --source "$EXPECTED_SHA" --config-sha "$CONFIG_SHA" --mode "$MODE"
+          echo "sha=$(sha256sum source/site/dist/atlas-provenance.json | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Upload noindex preview for local inspection only
+        if: inputs.mode == 'preview'
+        uses: actions/upload-artifact@v4
+        with: { name: atlas-preview-noindex, path: source/site/dist, retention-days: 14, if-no-files-found: error, include-hidden-files: true }
+      - name: Verify production counter CORS
+        if: inputs.mode == 'release'
+        run: |
+          python - <<'PY'
+          import json, re
+          from urllib.request import Request, urlopen
+          origin = 'https://atlas.mazunin.science'
+          with urlopen(Request('https://pgt-mt-atlas.goatcounter.com/counter/TOTAL.json', headers={'Origin': origin}), timeout=20) as response:
+              assert response.headers.get('Access-Control-Allow-Origin') in ('*', origin)
+              assert re.fullmatch(r'\d[\d\s,.]*', json.load(response)['count'])
+          PY
+      - name: Package verified Pages artifact
+        if: inputs.mode == 'release'
+        uses: actions/upload-pages-artifact@v3
+        with: { path: source/site/dist, retention-days: 14 }
+
+  deploy:
+    if: inputs.mode == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pages: write, id-token: write }
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with: { name: github-pages, path: pages-artifact }
+      - name: Verify exact packaged artifact against the build manifest
+        env:
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.manifest_sha }}
+          EXPECTED_SOURCE: ${{ needs.build.outputs.source_sha }}
+          CONFIG_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir pages-content
+          tar -xf pages-artifact/artifact.tar -C pages-content
+          echo "$EXPECTED_MANIFEST  pages-content/atlas-provenance.json" | sha256sum -c -
+          python scripts/provenance.py verify pages-content --source "$EXPECTED_SOURCE" --config-sha "$CONFIG_SHA" --mode release
+      - name: Confirm Pages is already configured for the intended root domain
+        id: pages
+        uses: actions/configure-pages@v5
+        with: { enablement: false }
+      - name: Refuse publication to another address
+        env: { PAGES_BASE_URL: '${{ steps.pages.outputs.base_url }}' }
+        run: test "${PAGES_BASE_URL%/}" = 'https://atlas.mazunin.science'
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify served bytes against the released manifest
+        env: { PAGES_URL: '${{ steps.deployment.outputs.page_url }}' }
+        run: python scripts/verify-published.py pages-content
