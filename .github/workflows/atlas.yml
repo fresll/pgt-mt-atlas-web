@@ -1,6 +1,9 @@
-name: Atlas — verified manual build and publication
+name: Atlas — verified build and publication
 
 on:
+  # After approval enable polling by uncommenting the following two lines:
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -8,7 +11,12 @@ on:
         required: true
         type: choice
         default: preview
-        options: [preview, release]
+        options: [preview, release, sync-preview]
+      source_sha:
+        description: 'Optional 40-character SHA for manual preview/release or rollback; defaults to source.env'
+        required: false
+        type: string
+        default: ''
       release_confirmation:
         description: 'Only for release: type PUBLISH atlas.mazunin.science'
         required: false
@@ -16,15 +24,35 @@ on:
         default: ''
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: atlas-web
   cancel-in-progress: false
 
 jobs:
+  select:
+    if: github.event_name == 'schedule' || inputs.mode == 'sync-preview'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      needs_update: ${{ steps.select.outputs.needs_update }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Test synchronization decision logic
+        run: python -m unittest discover -s tests -v
+      - name: Compare verified source deployment with the live domain
+        id: select
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: python scripts/sync.py
+
   build:
+    needs: select
+    if: always() && (github.event_name == 'workflow_dispatch' && inputs.mode != 'sync-preview' || needs.select.result == 'success' && needs.select.outputs.needs_update == 'true')
     runs-on: ubuntu-24.04
     outputs:
       source_sha: ${{ steps.pin.outputs.sha }}
+      mode: ${{ steps.pin.outputs.mode }}
       manifest_sha: ${{ steps.provenance.outputs.sha }}
     steps:
       - name: Check out publication configuration
@@ -34,18 +62,33 @@ jobs:
         id: pin
         shell: bash
         env:
-          MODE: ${{ inputs.mode }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          SELECTED_SHA: ${{ needs.select.outputs.sha }}
+          INPUT_SHA: ${{ inputs.source_sha }}
           CONFIRMATION: ${{ inputs.release_confirmation }}
           CONFIG_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          if [[ "$MODE" == release ]]; then
+          if [[ "$EVENT_NAME" == schedule ]]; then
+            [[ "$CONFIG_REF" == refs/heads/main ]] || { echo 'Schedule requires main'; exit 1; }
+            MODE=release
+            SHA="$SELECTED_SHA"
+          elif [[ "$REQUESTED_MODE" == sync-preview ]]; then
+            MODE=preview
+            SHA="$SELECTED_SHA"
+          else
+            MODE="$REQUESTED_MODE"
+            SHA="${INPUT_SHA:-$(sed -n 's/^ATLAS_SOURCE_SHA=//p' config/source.env)}"
+          fi
+          [[ "$MODE" == preview || "$MODE" == release ]] || exit 1
+          if [[ "$MODE" == release && "$EVENT_NAME" != schedule ]]; then
             [[ "$CONFIG_REF" == refs/heads/main && "$CONFIRMATION" == 'PUBLISH atlas.mazunin.science' ]] || { echo 'Release requires main and explicit confirmation'; exit 1; }
           fi
           [[ $(wc -l < config/source.env) -eq 2 ]]
-          SHA=$(sed -n 's/^ATLAS_SOURCE_SHA=//p' config/source.env)
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
       - name: Check out pinned scientific source
         uses: actions/checkout@v4
         with:
@@ -87,13 +130,22 @@ jobs:
         working-directory: source/site
         env: { ATLAS_BASE: /pgt-mt-atlas/ }
         run: npm run e2e
+      - name: Select canonical URL required by the source browser suite
+        working-directory: source/site
+        run: |
+          expected=$(sed -n "s/^const base = '\(https:[^']*\)'$/\1/p" e2e-public/indexing.spec.ts)
+          case "$expected" in
+            https://fresll.github.io/pgt-mt-atlas/|https://atlas.mazunin.science/) ;;
+            *) echo "Unrecognized canonical expected by source browser suite"; exit 1 ;;
+          esac
+          echo "SOURCE_TEST_CANONICAL=$expected" >> "$GITHUB_ENV"
       - name: Build public test candidate for the original suite
         working-directory: source/site
         env:
           ATLAS_BASE: /pgt-mt-atlas/
           ATLAS_SOFT_LAUNCH: '0'
           ATLAS_PUBLIC_LAUNCH: '1'
-          ATLAS_CANONICAL_BASE: https://atlas.mazunin.science/
+          ATLAS_CANONICAL_BASE: ${{ env.SOURCE_TEST_CANONICAL }}
           VITE_ATLAS_PRIVATE_PREVIEW: '0'
           VITE_ATLAS_ENGLISH_PUBLIC: '1'
           VITE_ATLAS_CHINESE_PUBLIC: '1'
@@ -118,10 +170,14 @@ jobs:
           VITE_ATLAS_ARABIC_PUBLIC: '1'
         run: |
           npm run build
-          python scripts/audit-indexing.py
-          npx playwright test --config playwright.domain.config.ts
+          python ../../config/scripts/domain/scripts/audit-indexing.py
+          test ! -e .atlas-sync-domain && test ! -e .atlas-sync-domain.config.ts
+          mkdir .atlas-sync-domain
+          cp ../../config/scripts/domain/e2e-domain/domain.spec.ts .atlas-sync-domain/domain.spec.ts
+          cp ../../config/scripts/domain/playwright.domain.config.ts .atlas-sync-domain.config.ts
+          npx playwright test --config .atlas-sync-domain.config.ts
       - name: Rebuild safe noindex preview
-        if: inputs.mode == 'preview'
+        if: steps.pin.outputs.mode == 'preview'
         working-directory: source/site
         env:
           ATLAS_BASE: /
@@ -145,7 +201,7 @@ jobs:
         env:
           EXPECTED_SHA: ${{ steps.pin.outputs.sha }}
           CONFIG_SHA: ${{ github.sha }}
-          MODE: ${{ inputs.mode }}
+          MODE: ${{ steps.pin.outputs.mode }}
         run: |
           set -euo pipefail
           test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
@@ -154,11 +210,11 @@ jobs:
           python config/scripts/provenance.py verify source/site/dist --source "$EXPECTED_SHA" --config-sha "$CONFIG_SHA" --mode "$MODE"
           echo "sha=$(sha256sum source/site/dist/atlas-provenance.json | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Upload noindex preview for local inspection only
-        if: inputs.mode == 'preview'
+        if: steps.pin.outputs.mode == 'preview'
         uses: actions/upload-artifact@v4
         with: { name: atlas-preview-noindex, path: source/site/dist, retention-days: 14, if-no-files-found: error, include-hidden-files: true }
       - name: Verify production counter CORS
-        if: inputs.mode == 'release'
+        if: steps.pin.outputs.mode == 'release'
         run: |
           python - <<'PY'
           import json, re
@@ -169,15 +225,23 @@ jobs:
               assert re.fullmatch(r'\d[\d\s,.]*', json.load(response)['count'])
           PY
       - name: Package verified Pages artifact
-        if: inputs.mode == 'release'
+        if: steps.pin.outputs.mode == 'release'
         uses: actions/upload-pages-artifact@v3
         with: { path: source/site/dist, retention-days: 14 }
 
+      - name: Report build failure
+        if: failure()
+        env: { SOURCE: '${{ steps.pin.outputs.sha }}' }
+        run: |
+          echo '### Publication skipped' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source SHA: $SOURCE" >> "$GITHUB_STEP_SUMMARY"
+          echo '- Build or verification failed; see failed step. Existing publication remains unchanged.' >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
-    if: inputs.mode == 'release'
+    if: needs.build.result == 'success' && needs.build.outputs.mode == 'release'
     needs: build
     runs-on: ubuntu-latest
-    permissions: { contents: read, pages: write, id-token: write }
+    permissions: { contents: read, actions: read, pages: write, id-token: write }
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -204,9 +268,33 @@ jobs:
       - name: Refuse publication to another address
         env: { PAGES_BASE_URL: '${{ steps.pages.outputs.base_url }}' }
         run: test "${PAGES_BASE_URL%/}" = 'https://atlas.mazunin.science'
+      - name: Recheck source and target immediately before automatic deploy
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE: ${{ needs.build.outputs.source_sha }}
+        run: python scripts/sync.py --expect "$EXPECTED_SOURCE"
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
       - name: Verify served bytes against the released manifest
+        id: verify_published
         env: { PAGES_URL: '${{ steps.deployment.outputs.page_url }}' }
         run: python scripts/verify-published.py pages-content
+      - name: Report publication result
+        if: always()
+        env:
+          SOURCE: ${{ needs.build.outputs.source_sha }}
+          DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify_published.outcome }}
+        run: |
+          echo "### Publication" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source SHA: \`$SOURCE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Deploy step: $DEPLOY_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Post-deployment verification: $VERIFY_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VERIFY_OUTCOME" == success ]]; then
+            echo "- Published SHA: $SOURCE (verified manifest and served bytes)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Successful verification time (UTC): $(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- See failed step; no automatic rollback was performed.' >> "$GITHUB_STEP_SUMMARY"
+          fi

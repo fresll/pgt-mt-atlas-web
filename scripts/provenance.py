@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -27,6 +28,8 @@ if args.operation == 'write':
     data = {'source_repository': 'fresll/pgt-mt-atlas', 'source_sha': args.source,
             'configuration_sha': args.config_sha, 'mode': args.mode, 'base': '/',
             'canonical_base': 'https://atlas.mazunin.science/', 'files_sha256': files()}
+    if os.getenv('GITHUB_RUN_ID'):
+        data['publication_run_id'] = os.environ['GITHUB_RUN_ID']
     if not data['files_sha256']:
         raise SystemExit('Empty site')
     manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
